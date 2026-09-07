@@ -1,0 +1,8 @@
+---
+# Nothing site-specific lives here anymore — site name, device IPs, VLANs,
+# and credentials are all prompted for at run time (see playbook.yml) so the
+# same playbook works unchanged across Troy, Emeryville, or any other site.
+
+# Where output lands, relative to wherever you run ansible-playbook from.
+# Each run creates its own subfolder named after the site you type in.
+discovery_output_dir: "./discovery_output"

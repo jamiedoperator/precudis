@@ -1,0 +1,242 @@
+---
+# precudis — site-agnostic firewall + switch discovery playbook.
+#
+# Nothing about a specific site (Troy, Emeryville, ...) — or how many devices
+# it has — is hardcoded. The first play prompts for a site label plus a
+# comma-separated list of Palo Alto management IPs and a comma-separated list
+# of Cisco switch/stack management IPs (any count of each, including zero of
+# one type), registers every IP as an in-memory host for this run only, then
+# the next two plays run the same discovery commands against every host that
+# got registered — one play per device type, regardless of how many devices
+# are in it.
+#
+# No stored credentials, no vault, no inventory file to edit per site — every
+# IP and every credential is prompted for at run time. Credentials are shared
+# across all devices of the same type in a single run (one firewall
+# username/password for every firewall entered, one switch username/password
+# for every switch entered) — if your devices use different per-device
+# credentials, run the playbook once per credential set with just those
+# devices' IPs.
+#
+# Run:
+#   ansible-galaxy collection install -r requirements.yml
+#   ansible-playbook playbook.yml
+
+- name: Collect site and device details
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_prompt:
+    - name: site_name
+      prompt: "Site short name (labels the output folder, e.g. troy, emeryville)"
+      private: false
+    - name: fw_ips_csv
+      prompt: "Palo Alto firewall management IP(s), comma-separated (leave blank if none this run)"
+      private: false
+      default: ""
+    - name: switch_ips_csv
+      prompt: "Cisco switch/stack management IP(s), comma-separated (leave blank if none this run)"
+      private: false
+      default: ""
+    - name: vlan_list_csv
+      prompt: "Comma-separated VLAN IDs for per-VLAN spanning-tree detail (leave blank to skip)"
+      private: false
+      default: ""
+  tasks:
+    - name: Work out the VLAN list from what was typed
+      ansible.builtin.set_fact:
+        vlans_list: >-
+          {{ (vlan_list_csv.split(',') | map('trim') | reject('equalto', '') | list)
+             if (vlan_list_csv | default('') | length > 0) else [] }}
+
+    - name: Work out the firewall IP list from what was typed
+      ansible.builtin.set_fact:
+        fw_ips_list: >-
+          {{ (fw_ips_csv.split(',') | map('trim') | reject('equalto', '') | list)
+             if (fw_ips_csv | default('') | length > 0) else [] }}
+
+    - name: Work out the switch IP list from what was typed
+      ansible.builtin.set_fact:
+        switch_ips_list: >-
+          {{ (switch_ips_csv.split(',') | map('trim') | reject('equalto', '') | list)
+             if (switch_ips_csv | default('') | length > 0) else [] }}
+
+    - name: Fail early if nothing was entered
+      ansible.builtin.fail:
+        msg: "Enter at least one firewall IP or one switch IP — nothing to discover otherwise."
+      when: (fw_ips_list | length) == 0 and (switch_ips_list | length) == 0
+
+    - name: Register every firewall entered for this run
+      ansible.builtin.add_host:
+        name: "{{ site_name }}-fw-{{ idx + 1 }}"
+        groups: panos_firewalls
+        ansible_host: "{{ item }}"
+        ansible_connection: local
+        site: "{{ site_name }}"
+      loop: "{{ fw_ips_list }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item }}"
+
+    - name: Register every switch (or stack) entered for this run
+      ansible.builtin.add_host:
+        name: "{{ site_name }}-switch-{{ idx + 1 }}"
+        groups: ios_switches
+        ansible_host: "{{ item }}"
+        ansible_connection: network_cli
+        ansible_network_os: cisco.ios.ios
+        ansible_become: true
+        ansible_become_method: enable
+        site: "{{ site_name }}"
+        vlans_list: "{{ vlans_list }}"
+      loop: "{{ switch_ips_list }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item }}"
+
+    - name: Report what will be discovered this run
+      ansible.builtin.debug:
+        msg: >-
+          Site '{{ site_name }}': {{ fw_ips_list | length }} firewall(s)
+          and {{ switch_ips_list | length }} switch(es)/stack(s) registered.
+
+- name: Palo Alto firewall discovery
+  hosts: panos_firewalls
+  gather_facts: false
+  vars_prompt:
+    - name: panos_username
+      prompt: "Username for all firewalls entered above (same credential used for each)"
+      private: false
+    - name: panos_password
+      prompt: "Password for all firewalls entered above"
+      private: true
+  vars:
+    provider:
+      ip_address: "{{ ansible_host }}"
+      username: "{{ panos_username }}"
+      password: "{{ panos_password }}"
+    panos_commands:
+      - { key: system_info,       cmd: "show system info" }
+      - { key: interfaces_all,    cmd: "show interface all" }
+      - { key: interfaces_hw,     cmd: "show interface hardware" }
+      - { key: ha_all,            cmd: "show high-availability all" }
+      - { key: ha_state,          cmd: "show high-availability state" }
+      - { key: ha_ha1,            cmd: "show high-availability interface ha1" }
+      - { key: ha_ha2,            cmd: "show high-availability interface ha2" }
+      - { key: routing_route,     cmd: "show routing route" }
+      - { key: routing_static,    cmd: "show routing route type static" }
+      - { key: vpn_ike_sa,        cmd: "show vpn ike-sa" }
+      - { key: vpn_ipsec_sa,      cmd: "show vpn ipsec-sa" }
+      - { key: vpn_flow,          cmd: "show vpn flow" }
+      - { key: lldp_neighbors,    cmd: "show lldp neighbors all" }
+      - { key: arp_all,           cmd: "show arp" }
+  tasks:
+    - name: Create per-host output directory
+      ansible.builtin.file:
+        path: "{{ discovery_output_dir }}/{{ site }}/{{ inventory_hostname }}"
+        state: directory
+      delegate_to: localhost
+
+    - name: Run each op command
+      paloaltonetworks.panos.panos_op:
+        provider: "{{ provider }}"
+        cmd: "{{ item.cmd }}"
+        cmd_is_xml: false
+      loop: "{{ panos_commands }}"
+      loop_control:
+        label: "{{ item.cmd }}"
+      register: panos_results
+      # A single command failing (e.g. no IPSec SA up yet) shouldn't stop the
+      # whole discovery run — capture the error text into the file instead.
+      ignore_errors: true
+
+    - name: Save each command's output to its own file
+      ansible.builtin.copy:
+        content: "{{ item.stdout | default('ERROR: ' ~ (item.msg | default('command failed'))) }}"
+        dest: "{{ discovery_output_dir }}/{{ site }}/{{ inventory_hostname }}/{{ item.item.key }}.txt"
+      loop: "{{ panos_results.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+      delegate_to: localhost
+
+    - name: Export full running configuration (XML)
+      paloaltonetworks.panos.panos_export:
+        provider: "{{ provider }}"
+        category: configuration
+        filename: "{{ discovery_output_dir }}/{{ site }}/{{ inventory_hostname }}/running-config.xml"
+      delegate_to: localhost
+      ignore_errors: true
+
+- name: Cisco switch / stack discovery
+  hosts: ios_switches
+  gather_facts: false
+  vars_prompt:
+    - name: ios_username
+      prompt: "Username for all switches/stacks entered above (same credential used for each)"
+      private: false
+    - name: ios_password
+      prompt: "Password for all switches/stacks entered above"
+      private: true
+    - name: ios_enable_password
+      prompt: "Enable/secret password for all switches/stacks (re-type login password if there's no separate enable secret)"
+      private: true
+  vars:
+    ansible_user: "{{ ios_username }}"
+    ansible_password: "{{ ios_password }}"
+    ansible_become_password: "{{ ios_enable_password }}"
+    ios_commands:
+      - "show switch"
+      - "show switch stack-ports"
+      - "show inventory"
+      - "show version"
+      - "show interfaces status"
+      - "show interfaces description"
+      - "show vlan brief"
+      - "show interfaces trunk"
+      - "show interfaces switchport"
+      - "show etherchannel summary"
+      - "show cdp neighbors detail"
+      - "show lldp neighbors detail"
+      - "show mac address-table"
+      - "show ip arp"
+      - "show spanning-tree summary"
+      - "show power inline"
+      - "show interfaces transceiver"
+      - "show running-config"
+  tasks:
+    - name: Create per-host output directory
+      ansible.builtin.file:
+        path: "{{ discovery_output_dir }}/{{ site }}/{{ inventory_hostname }}"
+        state: directory
+      delegate_to: localhost
+
+    - name: Run each show command
+      cisco.ios.ios_command:
+        commands: "{{ ios_commands }}"
+      register: ios_output
+
+    - name: Save each command's output to its own file
+      ansible.builtin.copy:
+        content: "{{ item }}"
+        dest: "{{ discovery_output_dir }}/{{ site }}/{{ inventory_hostname }}/{{ ios_commands[idx] | regex_replace('[ /]', '_') }}.txt"
+      loop: "{{ ios_output.stdout }}"
+      loop_control:
+        index_var: idx
+        label: "{{ ios_commands[idx] }}"
+      delegate_to: localhost
+
+    - name: Per-VLAN spanning-tree state (skipped automatically if no VLANs were entered)
+      cisco.ios.ios_command:
+        commands: "show spanning-tree vlan {{ item }}"
+      loop: "{{ vlans_list }}"
+      register: stp_vlan_output
+      ignore_errors: true
+
+    - name: Save per-VLAN spanning-tree output
+      ansible.builtin.copy:
+        content: "{{ item.stdout[0] | default('ERROR: ' ~ (item.msg | default('command failed'))) }}"
+        dest: "{{ discovery_output_dir }}/{{ site }}/{{ inventory_hostname }}/spanning_tree_vlan_{{ item.item }}.txt"
+      loop: "{{ stp_vlan_output.results }}"
+      loop_control:
+        label: "vlan {{ item.item }}"
+      delegate_to: localhost

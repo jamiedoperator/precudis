@@ -1,0 +1,9 @@
+---
+# Minimal on purpose — every real target (the firewalls, the switch) is
+# registered dynamically at run time by the playbook's first play, based on
+# what you type in. This file just needs to give Ansible somewhere to run
+# that first, local, prompt-collecting play from.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local

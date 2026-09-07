@@ -1,0 +1,4 @@
+ansible-core
+pan-python
+pan-os-python
+xmltodict
